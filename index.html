@@ -183,6 +183,11 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:59;
 #waveBars i{display:inline-block;width:2px;height:12px;margin:0 1.5px;background:currentColor;border-radius:2px;animation:eq .9s ease-in-out infinite}
 #waveBars i:nth-child(2){animation-delay:.15s}#waveBars i:nth-child(3){animation-delay:.3s}#waveBars i:nth-child(4){animation-delay:.45s}
 @keyframes eq{0%,100%{transform:scaleY(.4)}50%{transform:scaleY(1)}}
+#audioStatus{position:fixed;top:calc(66px + env(safe-area-inset-top));right:16px;z-index:50;
+  max-width:min(280px,calc(100vw - 32px));padding:8px 12px;border-radius:12px;
+  background:rgba(255,253,248,.96);box-shadow:0 4px 14px rgba(140,88,74,.2);
+  color:#6E6259;font:14px/1.4 Lora,Georgia,serif}
+#audioStatus:empty{display:none}
 
 /* final note reveal */
 #finalNote{max-height:0;opacity:0;overflow:hidden;transition:max-height .9s ease,opacity .8s ease .15s}
@@ -223,6 +228,7 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:59;
   <svg id="iconNote" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M9 18V6l10-2v12"/><circle cx="6.5" cy="18" r="2.6"/><circle cx="16.5" cy="16" r="2.6"/></svg>
   <span id="waveBars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
 </button>
+<div id="audioStatus" role="status" aria-live="polite"></div>
 
 <main id="stage">
 
@@ -458,7 +464,8 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:59;
 
   /* ---------- ambient audio: a soft WebAudio music-box loop ---------- */
   var btn = document.getElementById('audioBtn');
-  var ctx = null, master = null, timer = null;
+  var status = document.getElementById('audioStatus');
+  var ctx = null, master = null, timer = null, attempt = 0, userOff = false;
   var SCALE = [523.25, 587.33, 659.25, 783.99, 880.0, 1046.5]; // C5 D5 E5 G5 A5 C6
 
   function pluck(freq, when, gain) {
@@ -483,40 +490,72 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:59;
     btn.setAttribute('aria-pressed', String(on));
     btn.setAttribute('aria-label', on ? 'Tắt nhạc nền' : 'Bật nhạc nền');
   }
-  function startAudio() {
+  function running() { return !!ctx && ctx.state === 'running'; }
+  function beginLoop() {
     if (timer) return;
-    try {
-      if (!ctx) {
-        ctx = new (window.AudioContext || window.webkitAudioContext)();
-        master = ctx.createGain(); master.gain.value = 0.5; master.connect(ctx.destination);
-      }
-      /* resume() is the only reliable way to know whether the browser allowed
-         autoplay — so the button only lights up once sound is really running. */
-      var go = ctx.state === 'suspended' ? ctx.resume() : Promise.resolve();
-      Promise.resolve(go).then(function () {
-        if (ctx.state !== 'running') return;
-        if (!timer) { bar(); timer = setInterval(bar, 2200); }
-        show(true);
-      }, function () { show(false); });
-    } catch (e) { /* browser without WebAudio — stay silent */ }
+    bar(); timer = setInterval(bar, 2200);
+    show(true); status.textContent = '';
   }
-  function stopAudio() {
-    if (!timer) return;
-    clearInterval(timer); timer = null;
-    if (ctx) ctx.suspend();
-    show(false);
+  function stopLoop(msg) {
+    if (timer) { clearInterval(timer); timer = null; }
+    show(false); status.textContent = msg || '';
   }
 
-  /* Browsers only allow audio after a gesture, so: try now, then retry on the
-     very first touch/keypress — which is the gift tap on Scene 1 anyway. */
-  startAudio();
-  if (!timer) {
-    ['pointerdown', 'keydown'].forEach(function (ev) {
-      window.addEventListener(ev, startAudio, { once: true, passive: true });
+  function ensureCtx() {
+    if (ctx) return true;
+    var Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return false;
+    ctx = new Ctor();
+    master = ctx.createGain(); master.gain.value = 0.5; master.connect(ctx.destination);
+    /* iOS flips to 'interrupted' on a phone call, Siri or screen lock */
+    ctx.addEventListener('statechange', function () {
+      if (ctx.state !== 'running' && timer) stopLoop('Nhạc đang tạm dừng. Chạm nút nhạc để bật lại.');
     });
+    return true;
   }
-  btn.addEventListener('pointerdown', function (e) { e.stopPropagation(); });
-  btn.addEventListener('click', function () { timer ? stopAudio() : startAudio(); });
+
+  /* iOS Safari parks a blocked context in 'suspended' *or* its own 'interrupted'
+     state, and resume() clears either one. Older WebKit may never settle the
+     resume() promise, so poll ctx.state instead of chaining on it. */
+  function startAudio(explicit) {
+    if (userOff && !explicit) return;
+    var mine = ++attempt;
+    if (!ensureCtx()) {
+      if (explicit) stopLoop('Trình duyệt này không phát được nhạc nền.');
+      return;
+    }
+    try { ctx.resume(); } catch (e) { /* resume() is missing on very old WebKit */ }
+    var tries = 0;
+    (function wait() {
+      if (mine !== attempt) return;                      // a newer request took over
+      if (running()) return beginLoop();
+      if (++tries > 8) {
+        if (explicit) stopLoop('Chưa bật được nhạc, Mẹ chạm nút này thêm lần nữa nhé.');
+        return;
+      }
+      setTimeout(wait, 120);
+    })();
+  }
+  function stopAudio() {
+    userOff = true;
+    ++attempt;
+    stopLoop('');
+    try { if (running()) ctx.suspend(); } catch (e) {}
+  }
+
+  /* Desktop autoplays straight away; mobile needs the first tap to unlock. */
+  startAudio(false);
+  function unlock(e) {
+    if (btn.contains(e.target) || userOff) return;
+    startAudio(false);
+  }
+  ['pointerdown', 'touchstart', 'keydown'].forEach(function (ev) {
+    window.addEventListener(ev, unlock, { passive: true });
+  });
+  btn.addEventListener('click', function () {
+    if (running() && timer) stopAudio();
+    else { userOff = false; startAudio(true); }
+  });
 })();
 </script>
 </body>
